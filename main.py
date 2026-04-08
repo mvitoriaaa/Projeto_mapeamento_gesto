@@ -20,7 +20,6 @@ from mediapipe.tasks.python.vision import (
     HandLandmarker,
     HandLandmarkerOptions,
     HandLandmarksConnections,
-    drawing_styles,
     drawing_utils,
 )
 from mediapipe.tasks.python.vision.core.vision_task_running_mode import (
@@ -62,6 +61,11 @@ PRIVATE_SIGNAL_MIN_COUNT = 8
 PRIVATE_SIGNAL_LABEL = "__signal_variant_01__"
 PRIVATE_SIGNAL_DISPLAY = "SECRET"
 PRIVATE_SIGNAL_COLOR = (170, 230, 170)
+LANDMARK_INDEX_COLOR = (245, 245, 245)
+LANDMARK_INDEX_BG_COLOR = (35, 35, 35)
+HAND_LANDMARK_COLOR = (235, 235, 235)
+HAND_CONNECTION_COLOR = (120, 120, 120)
+FEATURE_VERSION = 2
 
 TIP_IDS = {
     "thumb": 4,
@@ -122,6 +126,18 @@ GESTURE_INFO = {
 }
 
 CHALLENGE_GESTURES = list(GESTURE_INFO)
+TIP_ORDER = ["thumb", "index", "middle", "ring", "pinky"]
+
+HAND_LANDMARK_SPEC = drawing_utils.DrawingSpec(
+    color=HAND_LANDMARK_COLOR,
+    thickness=2,
+    circle_radius=3,
+)
+HAND_CONNECTION_SPEC = drawing_utils.DrawingSpec(
+    color=HAND_CONNECTION_COLOR,
+    thickness=2,
+    circle_radius=1,
+)
 
 
 @dataclass
@@ -297,6 +313,18 @@ def normalized_value(value, lower, upper):
     return clamp((value - lower) / (upper - lower))
 
 
+def feature_columns():
+    columns = ["feature_version", "handedness_right"]
+    for index in range(21):
+        columns.extend([f"lm_{index}_x", f"lm_{index}_y", f"lm_{index}_z"])
+    for finger_name in TIP_ORDER:
+        columns.append(f"{finger_name}_tip_wrist_distance")
+    for left_index, left_name in enumerate(TIP_ORDER):
+        for right_name in TIP_ORDER[left_index + 1 :]:
+            columns.append(f"{left_name}_{right_name}_tip_distance")
+    return columns
+
+
 def open_camera(camera_index=0):
     backends = [cv2.CAP_DSHOW, cv2.CAP_ANY]
 
@@ -446,6 +474,31 @@ def compute_hand_metrics(landmarks, handedness_label, width, height):
     }
 
 
+def canonical_landmark_triplets(landmarks, handedness_label):
+    wrist = landmarks[0]
+    middle_mcp = landmarks[9]
+    palm_size = max(
+        math.sqrt(
+            (middle_mcp.x - wrist.x) ** 2
+            + (middle_mcp.y - wrist.y) ** 2
+            + (middle_mcp.z - wrist.z) ** 2
+        ),
+        1e-6,
+    )
+    mirror = -1.0 if handedness_label == "Left" else 1.0
+
+    triplets = []
+    for landmark in landmarks:
+        triplets.append(
+            (
+                ((landmark.x - wrist.x) / palm_size) * mirror,
+                (landmark.y - wrist.y) / palm_size,
+                (landmark.z - wrist.z) / palm_size,
+            )
+        )
+    return triplets
+
+
 def detect_private_signal(metrics):
     states = metrics["states"]
     extension_ratios = metrics["extension_ratios"]
@@ -546,26 +599,35 @@ def rule_based_prediction(metrics):
 
 
 def flatten_landmarks(landmarks, handedness_label):
-    wrist = landmarks[0]
-    middle_mcp = landmarks[9]
-    palm_size = max(
-        math.sqrt(
-            (middle_mcp.x - wrist.x) ** 2
-            + (middle_mcp.y - wrist.y) ** 2
-            + (middle_mcp.z - wrist.z) ** 2
-        ),
-        1e-6,
-    )
+    triplets = canonical_landmark_triplets(landmarks, handedness_label)
 
-    features = [1.0 if handedness_label == "Right" else 0.0]
-    for landmark in landmarks:
-        features.extend(
-            [
-                (landmark.x - wrist.x) / palm_size,
-                (landmark.y - wrist.y) / palm_size,
-                (landmark.z - wrist.z) / palm_size,
-            ]
+    features = [float(FEATURE_VERSION), 1.0 if handedness_label == "Right" else 0.0]
+    for x_value, y_value, z_value in triplets:
+        features.extend([x_value, y_value, z_value])
+
+    wrist_triplet = triplets[0]
+    tip_triplets = {finger_name: triplets[TIP_IDS[finger_name]] for finger_name in TIP_ORDER}
+    for finger_name in TIP_ORDER:
+        tip = tip_triplets[finger_name]
+        features.append(
+            math.sqrt(
+                (tip[0] - wrist_triplet[0]) ** 2
+                + (tip[1] - wrist_triplet[1]) ** 2
+                + (tip[2] - wrist_triplet[2]) ** 2
+            )
         )
+
+    for left_index, left_name in enumerate(TIP_ORDER):
+        for right_name in TIP_ORDER[left_index + 1 :]:
+            left_tip = tip_triplets[left_name]
+            right_tip = tip_triplets[right_name]
+            features.append(
+                math.sqrt(
+                    (left_tip[0] - right_tip[0]) ** 2
+                    + (left_tip[1] - right_tip[1]) ** 2
+                    + (left_tip[2] - right_tip[2]) ** 2
+                )
+            )
     return features
 
 
@@ -602,10 +664,19 @@ def predict_gesture(classifier_bundle, landmarks, handedness_label, width, heigh
 
 def ensure_dataset_header():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    if DATASET_PATH.exists():
-        return
+    feature_names = feature_columns()
+    headers = ["label", "handedness", *feature_names]
 
-    headers = ["label", "handedness"] + [f"f{i}" for i in range(64)]
+    if DATASET_PATH.exists():
+        with DATASET_PATH.open("r", newline="", encoding="utf-8") as file_obj:
+            reader = csv.reader(file_obj)
+            existing_header = next(reader, [])
+        if existing_header == headers:
+            return
+
+        legacy_path = DATA_DIR / f"gesture_samples_legacy_{int(time.time())}.csv"
+        DATASET_PATH.replace(legacy_path)
+
     with DATASET_PATH.open("w", newline="", encoding="utf-8") as file_obj:
         writer = csv.writer(file_obj)
         writer.writerow(headers)
@@ -633,6 +704,23 @@ def draw_info_line(panel, text, y, color=(240, 240, 240), scale=0.55, thickness=
         thickness,
         cv2.LINE_AA,
     )
+
+
+def draw_landmark_indices(frame, landmarks):
+    height, width = frame.shape[:2]
+    for index, landmark in enumerate(landmarks):
+        x_pos, y_pos = pixel_coords(landmark, width, height)
+        cv2.circle(frame, (x_pos, y_pos), 10, LANDMARK_INDEX_BG_COLOR, -1)
+        cv2.putText(
+            frame,
+            str(index),
+            (x_pos - 6, y_pos + 4),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.35,
+            LANDMARK_INDEX_COLOR,
+            1,
+            cv2.LINE_AA,
+        )
 
 
 def draw_side_panel(
@@ -767,7 +855,10 @@ def train_local_classifier():
     if joblib is None:
         raise RuntimeError("Instale joblib e scikit-learn para treinar o modelo.")
 
-    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.ensemble import ExtraTreesClassifier, RandomForestClassifier, VotingClassifier
+    from sklearn.pipeline import Pipeline
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.svm import SVC
 
     if not DATASET_PATH.exists():
         raise RuntimeError("Nenhum dataset encontrado. Colete amostras primeiro.")
@@ -776,11 +867,12 @@ def train_local_classifier():
     labels = []
     with DATASET_PATH.open("r", newline="", encoding="utf-8") as file_obj:
         reader = csv.DictReader(file_obj)
+        feature_names = [name for name in (reader.fieldnames or []) if name not in {"label", "handedness"}]
         for row in reader:
             if is_private_signal(row["label"]):
                 continue
             labels.append(row["label"])
-            rows.append([float(row[f"f{i}"]) for i in range(64)])
+            rows.append([float(row[name]) for name in feature_names])
 
     if len(rows) < 12:
         raise RuntimeError("Colete pelo menos 12 amostras antes de treinar.")
@@ -790,10 +882,47 @@ def train_local_classifier():
         raise RuntimeError("Colete ao menos 2 gestos diferentes para treinar.")
 
     ARTIFACTS_DIR.mkdir(parents=True, exist_ok=True)
-    classifier = RandomForestClassifier(
-        n_estimators=250,
-        random_state=42,
-        class_weight="balanced",
+    classifier = VotingClassifier(
+        estimators=[
+            (
+                "svc",
+                Pipeline(
+                    [
+                        ("scaler", StandardScaler()),
+                        (
+                            "svc",
+                            SVC(
+                                C=8.0,
+                                gamma="scale",
+                                probability=True,
+                                class_weight="balanced",
+                                random_state=42,
+                            ),
+                        ),
+                    ]
+                ),
+            ),
+            (
+                "rf",
+                RandomForestClassifier(
+                    n_estimators=400,
+                    random_state=42,
+                    class_weight="balanced_subsample",
+                    max_features="sqrt",
+                    min_samples_leaf=1,
+                ),
+            ),
+            (
+                "et",
+                ExtraTreesClassifier(
+                    n_estimators=400,
+                    random_state=42,
+                    class_weight="balanced",
+                    max_features="sqrt",
+                ),
+            ),
+        ],
+        voting="soft",
     )
     classifier.fit(rows, labels)
     joblib.dump(classifier, CLASSIFIER_PATH)
@@ -863,9 +992,10 @@ def run_app(camera_index):
                     frame,
                     landmarks,
                     HandLandmarksConnections.HAND_CONNECTIONS,
-                    drawing_styles.get_default_hand_landmarks_style(),
-                    drawing_styles.get_default_hand_connections_style(),
+                    HAND_LANDMARK_SPEC,
+                    HAND_CONNECTION_SPEC,
                 )
+                draw_landmark_indices(frame, landmarks)
             else:
                 stable_prediction, _ = smoother.update(None)
 
