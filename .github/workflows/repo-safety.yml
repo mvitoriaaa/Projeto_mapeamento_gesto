@@ -1,0 +1,22 @@
+name: Repo Safety
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  repo-safety:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Run repository safety scan
+        run: python scripts/check_repo_safety.py
