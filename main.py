@@ -31,7 +31,6 @@ try:
 except ImportError:  # pragma: no cover - optional until the user installs extras
     joblib = None
 
-
 BASE_DIR = Path(__file__).resolve().parent
 MODEL_PATH = BASE_DIR / "models" / "hand_landmarker.task"
 MODEL_URL = (
@@ -307,6 +306,36 @@ def distance(a, b):
     return math.hypot(a[0] - b[0], a[1] - b[1])
 
 
+def landmark_distance_3d(point_a, point_b):
+    return math.sqrt(
+        (point_a.x - point_b.x) ** 2
+        + (point_a.y - point_b.y) ** 2
+        + (point_a.z - point_b.z) ** 2
+    )
+
+
+def landmark_angle(point_a, point_b, point_c):
+    vector_ab = (
+        point_a.x - point_b.x,
+        point_a.y - point_b.y,
+        point_a.z - point_b.z,
+    )
+    vector_cb = (
+        point_c.x - point_b.x,
+        point_c.y - point_b.y,
+        point_c.z - point_b.z,
+    )
+    magnitude_ab = math.sqrt(sum(value * value for value in vector_ab))
+    magnitude_cb = math.sqrt(sum(value * value for value in vector_cb))
+    if magnitude_ab == 0 or magnitude_cb == 0:
+        return 0.0
+
+    cosine = sum(a_value * c_value for a_value, c_value in zip(vector_ab, vector_cb))
+    cosine /= magnitude_ab * magnitude_cb
+    cosine = max(-1.0, min(1.0, cosine))
+    return math.degrees(math.acos(cosine))
+
+
 def normalized_value(value, lower, upper):
     if upper <= lower:
         return 0.0
@@ -387,7 +416,7 @@ def create_hand_landmarker():
     options = HandLandmarkerOptions(
         base_options=BaseOptions(model_asset_path=str(MODEL_PATH)),
         running_mode=VisionTaskRunningMode.VIDEO,
-        num_hands=1,
+        num_hands=2,
         min_hand_detection_confidence=0.6,
         min_hand_presence_confidence=0.6,
         min_tracking_confidence=0.6,
@@ -405,12 +434,50 @@ def load_classifier():
 
 
 def is_thumb_extended(landmarks, handedness_label):
+    wrist = landmarks[0]
+    thumb_cmc = landmarks[1]
+    thumb_mcp = landmarks[2]
     thumb_tip = landmarks[TIP_IDS["thumb"]]
     thumb_ip = landmarks[PIP_IDS["thumb"]]
+    index_mcp = landmarks[5]
+    middle_mcp = landmarks[9]
+
+    palm_size = max(landmark_distance_3d(wrist, middle_mcp), 1e-6)
+    thumb_spread = landmark_distance_3d(thumb_tip, index_mcp) / palm_size
+    thumb_reach = landmark_distance_3d(thumb_tip, wrist) / palm_size
+    thumb_open_angle = landmark_angle(thumb_mcp, thumb_ip, thumb_tip)
+    thumb_base_angle = landmark_angle(thumb_cmc, thumb_mcp, thumb_ip)
 
     if handedness_label == "Right":
-        return thumb_tip.x < thumb_ip.x
-    return thumb_tip.x > thumb_ip.x
+        lateral_direction = thumb_tip.x < thumb_ip.x
+    else:
+        lateral_direction = thumb_tip.x > thumb_ip.x
+
+    other_fingers_extended = sum(
+        [
+            is_finger_extended(landmarks, "index"),
+            is_finger_extended(landmarks, "middle"),
+            is_finger_extended(landmarks, "ring"),
+            is_finger_extended(landmarks, "pinky"),
+        ]
+    )
+
+    strong_thumb_extension = (
+        thumb_spread > 0.44
+        and thumb_reach > 0.82
+        and thumb_open_angle > 145
+        and thumb_base_angle > 135
+        and lateral_direction
+    )
+
+    open_palm_thumb_extension = (
+        other_fingers_extended >= 3
+        and thumb_spread > 0.36
+        and thumb_reach > 0.74
+        and thumb_open_angle > 135
+    )
+
+    return strong_thumb_extension or open_palm_thumb_extension
 
 
 def is_finger_extended(landmarks, finger_name):
@@ -723,11 +790,69 @@ def draw_landmark_indices(frame, landmarks):
         )
 
 
+def prediction_display_name(prediction):
+    if not prediction or not prediction.label:
+        return "-"
+    if is_private_signal(prediction.label):
+        return PRIVATE_SIGNAL_DISPLAY
+    return GESTURE_INFO.get(prediction.label, {}).get("display", prediction.label.upper())
+
+
+def prediction_color(prediction):
+    if not prediction or not prediction.label:
+        return (200, 200, 200)
+    if is_private_signal(prediction.label):
+        return PRIVATE_SIGNAL_COLOR
+    return GESTURE_INFO.get(prediction.label, {}).get("color", (220, 220, 220))
+
+
+def draw_hand_label(frame, landmarks, handedness, prediction):
+    height, width = frame.shape[:2]
+    x_positions = []
+    y_positions = []
+    for landmark in landmarks:
+        x_pos, y_pos = pixel_coords(landmark, width, height)
+        x_positions.append(x_pos)
+        y_positions.append(y_pos)
+
+    anchor_x = max(min(x_positions) - 4, 8)
+    anchor_y = max(min(y_positions) - 14, 28)
+    short_hand = "L" if handedness == "Left" else "R" if handedness == "Right" else handedness[:1]
+    label_text = short_hand
+    if prediction and prediction.label:
+        label_text = f"{short_hand}: {prediction_display_name(prediction)}"
+
+    text_size, _ = cv2.getTextSize(
+        label_text,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        2,
+    )
+    cv2.rectangle(
+        frame,
+        (anchor_x - 6, anchor_y - text_size[1] - 8),
+        (anchor_x + text_size[0] + 8, anchor_y + 6),
+        (22, 22, 22),
+        -1,
+    )
+    cv2.putText(
+        frame,
+        label_text,
+        (anchor_x, anchor_y),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        prediction_color(prediction),
+        2,
+        cv2.LINE_AA,
+    )
+
+
 def draw_side_panel(
     frame,
     stable_prediction,
     raw_prediction,
     handedness,
+    hand_count,
     finger_count,
     fps,
     collection_label,
@@ -760,41 +885,42 @@ def draw_side_panel(
     draw_info_line(panel, f"Gesto estavel: {display_name}", 72, color, 0.6, 2)
     draw_info_line(panel, f"Confianca: {stable_prediction.confidence:.2f}", 100)
     draw_info_line(panel, f"Origem: {source}", 126)
-    draw_info_line(panel, f"Mao: {handedness or '-'}", 152)
-    draw_info_line(panel, f"Dedos levantados: {finger_count}", 178)
-    draw_info_line(panel, f"FPS: {fps:.1f}", 204)
-    draw_info_line(panel, f"Modelo treinado: {'sim' if classifier_bundle else 'nao'}", 230)
-    draw_info_line(panel, f"Amostras CSV: {sample_count}", 256)
+    draw_info_line(panel, f"Mao principal: {handedness or '-'}", 152)
+    draw_info_line(panel, f"Maos detectadas: {hand_count}", 178)
+    draw_info_line(panel, f"Dedos levantados: {finger_count}", 204)
+    draw_info_line(panel, f"FPS: {fps:.1f}", 230)
+    draw_info_line(panel, f"Modelo treinado: {'sim' if classifier_bundle else 'nao'}", 256)
+    draw_info_line(panel, f"Amostras CSV: {sample_count}", 282)
 
-    cv2.line(panel, (18, 274), (PANEL_WIDTH - 18, 274), (80, 80, 90), 1)
-    draw_info_line(panel, "Coleta de dados", 300, (255, 220, 180), 0.62, 2)
+    cv2.line(panel, (18, 300), (PANEL_WIDTH - 18, 300), (80, 80, 90), 1)
+    draw_info_line(panel, "Coleta de dados", 326, (255, 220, 180), 0.62, 2)
     draw_info_line(
         panel,
         f"Rotulo atual: {GESTURE_INFO[collection_label]['display']}",
-        328,
+        354,
         GESTURE_INFO[collection_label]["color"],
         0.56,
         2,
     )
-    draw_info_line(panel, "1-6 troca o rotulo", 352)
-    draw_info_line(panel, "C salva a amostra atual", 376)
-    draw_info_line(panel, "T treina o modelo local", 400)
+    draw_info_line(panel, "1-6 troca o rotulo", 378)
+    draw_info_line(panel, "C salva a mao principal", 402)
+    draw_info_line(panel, "T treina o modelo local", 426)
 
-    cv2.line(panel, (18, 418), (PANEL_WIDTH - 18, 418), (80, 80, 90), 1)
-    draw_info_line(panel, "Modo desafio", 444, (190, 230, 255), 0.62, 2)
+    cv2.line(panel, (18, 444), (PANEL_WIDTH - 18, 444), (80, 80, 90), 1)
+    draw_info_line(panel, "Modo desafio", 470, (190, 230, 255), 0.62, 2)
     target_display = (
         GESTURE_INFO[challenge_state.target_label]["display"]
         if challenge_state.target_label
         else "-"
     )
-    draw_info_line(panel, f"Alvo: {target_display}", 470)
-    draw_info_line(panel, f"Pontuacao: {challenge_state.score}", 494)
-    draw_info_line(panel, challenge_state.status_text[:32], 518)
-    draw_info_line(panel, "G inicia/pausa desafio", 542)
+    draw_info_line(panel, f"Alvo: {target_display}", 496)
+    draw_info_line(panel, f"Pontuacao: {challenge_state.score}", 520)
+    draw_info_line(panel, challenge_state.status_text[:32], 544)
+    draw_info_line(panel, "G inicia/pausa desafio", 568)
 
-    cv2.line(panel, (18, 560), (PANEL_WIDTH - 18, 560), (80, 80, 90), 1)
-    draw_info_line(panel, "Atalhos", 586, (220, 220, 220), 0.62, 2)
-    draw_info_line(panel, "Q sair", 612)
+    cv2.line(panel, (18, 586), (PANEL_WIDTH - 18, 586), (80, 80, 90), 1)
+    draw_info_line(panel, "Atalhos", 612, (220, 220, 220), 0.62, 2)
+    draw_info_line(panel, "Q sair", 638)
 
     frame[:, -PANEL_WIDTH:] = panel
 
@@ -949,7 +1075,7 @@ def run_app(camera_index):
 
     classifier_bundle = load_classifier()
     hand_landmarker = create_hand_landmarker()
-    smoother = GestureSmoother()
+    hand_smoothers = {}
     logger = SessionLogger()
     challenge_state = ChallengeState()
     collection_label = "ok"
@@ -971,33 +1097,81 @@ def run_app(camera_index):
             frame_index += 1
 
             handedness = ""
+            hand_count = 0
             finger_count = 0
             raw_prediction = GesturePrediction("", 0.0, "none")
             stable_prediction = GesturePrediction("", 0.0, "none")
+            primary_hand_result = None
+            active_smoother_keys = set()
 
             if result.hand_landmarks and result.handedness:
-                landmarks = result.hand_landmarks[0]
-                handedness = result.handedness[0][0].category_name or "Right"
-                raw_prediction, metrics, _ = predict_gesture(
-                    classifier_bundle,
-                    landmarks,
-                    handedness,
-                    frame.shape[1],
-                    frame.shape[0],
-                )
-                finger_count = metrics["finger_count"]
-                stable_prediction, _ = smoother.update(raw_prediction)
+                hand_count = len(result.hand_landmarks)
 
-                drawing_utils.draw_landmarks(
-                    frame,
-                    landmarks,
-                    HandLandmarksConnections.HAND_CONNECTIONS,
-                    HAND_LANDMARK_SPEC,
-                    HAND_CONNECTION_SPEC,
-                )
-                draw_landmark_indices(frame, landmarks)
+                for hand_index, (landmarks, handedness_info) in enumerate(
+                    zip(result.hand_landmarks, result.handedness)
+                ):
+                    handedness_label = handedness_info[0].category_name or f"Hand{hand_index + 1}"
+                    smoother_key = handedness_label
+                    if smoother_key in active_smoother_keys:
+                        smoother_key = f"{handedness_label}_{hand_index}"
+                    active_smoother_keys.add(smoother_key)
+
+                    if smoother_key not in hand_smoothers:
+                        hand_smoothers[smoother_key] = GestureSmoother()
+
+                    raw_candidate, metrics, _ = predict_gesture(
+                        classifier_bundle,
+                        landmarks,
+                        handedness_label,
+                        frame.shape[1],
+                        frame.shape[0],
+                    )
+                    stable_candidate, _ = hand_smoothers[smoother_key].update(raw_candidate)
+
+                    drawing_utils.draw_landmarks(
+                        frame,
+                        landmarks,
+                        HandLandmarksConnections.HAND_CONNECTIONS,
+                        HAND_LANDMARK_SPEC,
+                        HAND_CONNECTION_SPEC,
+                    )
+                    draw_landmark_indices(frame, landmarks)
+                    draw_hand_label(frame, landmarks, handedness_label, stable_candidate)
+
+                    candidate_result = {
+                        "handedness": handedness_label,
+                        "raw_prediction": raw_candidate,
+                        "stable_prediction": stable_candidate,
+                        "metrics": metrics,
+                        "landmarks": landmarks,
+                    }
+
+                    candidate_score = (
+                        stable_candidate.confidence if stable_candidate.label else raw_candidate.confidence
+                    )
+                    primary_score = -1.0
+                    if primary_hand_result is not None:
+                        primary_stable = primary_hand_result["stable_prediction"]
+                        primary_raw = primary_hand_result["raw_prediction"]
+                        primary_score = (
+                            primary_stable.confidence if primary_stable.label else primary_raw.confidence
+                        )
+
+                    if primary_hand_result is None or candidate_score >= primary_score:
+                        primary_hand_result = candidate_result
+
+                for smoother_key, smoother in hand_smoothers.items():
+                    if smoother_key not in active_smoother_keys:
+                        smoother.update(None)
             else:
-                stable_prediction, _ = smoother.update(None)
+                for smoother in hand_smoothers.values():
+                    smoother.update(None)
+
+            if primary_hand_result is not None:
+                handedness = primary_hand_result["handedness"]
+                raw_prediction = primary_hand_result["raw_prediction"]
+                stable_prediction = primary_hand_result["stable_prediction"]
+                finger_count = primary_hand_result["metrics"]["finger_count"]
 
             public_raw_prediction = sanitize_public_prediction(raw_prediction)
             public_stable_prediction = sanitize_public_prediction(stable_prediction)
@@ -1024,6 +1198,7 @@ def run_app(camera_index):
                 public_stable_prediction,
                 public_raw_prediction,
                 handedness,
+                hand_count,
                 finger_count,
                 fps,
                 collection_label,
@@ -1043,9 +1218,13 @@ def run_app(camera_index):
                     f"Rotulo de coleta alterado para {GESTURE_INFO[collection_label]['display']}"
                 )
             elif key == ord("c"):
-                if result.hand_landmarks and result.handedness:
+                if primary_hand_result is not None:
                     if is_collectible_prediction(raw_prediction):
-                        append_sample(collection_label, result.hand_landmarks[0], handedness)
+                        append_sample(
+                            collection_label,
+                            primary_hand_result["landmarks"],
+                            handedness,
+                        )
                         sample_count += 1
                         status_message = (
                             f"Amostra salva para {GESTURE_INFO[collection_label]['display']}"
